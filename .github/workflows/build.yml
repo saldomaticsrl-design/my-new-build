@@ -15,6 +15,8 @@ jobs:
           import os, re
 
           def patch_file(path, anchor, insertion, after=True):
+              if not os.path.exists(path):
+                  return
               with open(path, 'r', encoding='utf-8', errors='replace') as f:
                   c = f.read()
               if insertion.strip() in c:
@@ -29,6 +31,7 @@ jobs:
               with open(path, 'w', encoding='utf-8') as f:
                   f.write(new_c)
 
+          # 1. Create SIE engine files
           os.makedirs('duckstation/src/sise', exist_ok=True)
           with open('duckstation/src/sise/sie.h', 'w') as f:
               f.write('''#pragma once
@@ -92,6 +95,7 @@ jobs:
           }
           }  // namespace SIE''')
 
+          # 2. Patch interpreter (cpu_core.cpp)
           cp = 'duckstation/src/core/cpu_core.cpp'
           with open(cp, 'r') as f:
               cc = f.read()
@@ -107,18 +111,30 @@ jobs:
           with open(cp, 'w') as f:
               f.write(cc)
 
-          rc_path = 'duckstation/src/core/cpu_recompiler_codegen.cpp'
-          with open(rc_path, 'r') as f:
-              rc = f.read()
-          rc = rc.replace(
-              'Value val = CallCFunc(&GTE::ReadRegister, MakeRegParam(idx));',
-              'Value original_val = CallCFunc(&GTE::ReadRegister, MakeRegParam(idx));\n              Value val = CallCFunc(&GTE::ScaleZRegister, MakeRegParam(idx), original_val);')
-          rc = rc.replace(
-              'CallCFunc(&PGXP::CPU_MFC2, MakeRegParam(inst.bits), val);',
-              'CallCFunc(&PGXP::CPU_MFC2, MakeRegParam(inst.bits), original_val);')
-          with open(rc_path, 'w') as f:
-              f.write(rc)
+          # 3. Patch recompiler – search for the correct file
+          rc_path = None
+          for candidate in ['duckstation/src/core/cpu_recompiler_codegen.cpp',
+                            'duckstation/src/core/cpu_recompiler_codegen_x86.cpp',
+                            'duckstation/src/core/cpu_recompiler.cpp']:
+              if os.path.exists(candidate):
+                  rc_path = candidate
+                  break
+          if rc_path:
+              with open(rc_path, 'r') as f:
+                  rc = f.read()
+              rc = rc.replace(
+                  'Value val = CallCFunc(&GTE::ReadRegister, MakeRegParam(idx));',
+                  'Value original_val = CallCFunc(&GTE::ReadRegister, MakeRegParam(idx));\n              Value val = CallCFunc(&GTE::ScaleZRegister, MakeRegParam(idx), original_val);')
+              rc = rc.replace(
+                  'CallCFunc(&PGXP::CPU_MFC2, MakeRegParam(inst.bits), val);',
+                  'CallCFunc(&PGXP::CPU_MFC2, MakeRegParam(inst.bits), original_val);')
+              with open(rc_path, 'w') as f:
+                  f.write(rc)
+              print(f"Recompiler patched: {rc_path}")
+          else:
+              print("WARNING: Recompiler file not found; SIE will work in interpreter only.")
 
+          # 4. Patch GTE (OTZ scaling)
           gte_cpp = 'duckstation/src/core/gte.cpp'
           with open(gte_cpp, 'r') as f:
               gte = f.read()
@@ -134,6 +150,7 @@ jobs:
                      'u32 ScaleZRegister(u32 idx, u32 value);\n} // namespace GTE',
                      after=False)
 
+          # 5. Add UI widget
           ui_h = '''#pragma once
           #include <QWidget>
           class QCheckBox; class QLabel; class QSlider;
@@ -199,36 +216,42 @@ jobs:
           with open('duckstation/src/duckstation-qt/sisesettingswidget.cpp', 'w') as f:
               f.write(ui_cpp)
 
+          # Register widget in settingswindow.cpp
           sw = 'duckstation/src/duckstation-qt/settingswindow.cpp'
-          with open(sw, 'r') as f:
-              sc = f.read()
-          sc = sc.replace('#include "graphicssettingswidget.h"',
-                          '#include "sisesettingswidget.h"\n#include "graphicssettingswidget.h"')
-          sc = sc.replace('addWidget(new GraphicsSettingsWidget',
-                          'addWidget(new SIESettingsWidget(m_ui.settingsContainer),\n          tr("Enhanced Draw Distance"),\n          u":/icons/monochrome/svg/eye-line.svg"_s,\n          tr("<strong>Enhanced Draw Distance</strong><hr>Extends draw distance by scaling depth values."));\n  addWidget(new GraphicsSettingsWidget')
-          with open(sw, 'w') as f:
-              f.write(sc)
+          if os.path.exists(sw):
+              with open(sw, 'r') as f:
+                  sc = f.read()
+              sc = sc.replace('#include "graphicssettingswidget.h"',
+                              '#include "sisesettingswidget.h"\n#include "graphicssettingswidget.h"')
+              sc = sc.replace('addWidget(new GraphicsSettingsWidget',
+                              'addWidget(new SIESettingsWidget(m_ui.settingsContainer),\n          tr("Enhanced Draw Distance"),\n          u":/icons/monochrome/svg/eye-line.svg"_s,\n          tr("<strong>Enhanced Draw Distance</strong><hr>Extends draw distance by scaling depth values."));\n  addWidget(new GraphicsSettingsWidget')
+              with open(sw, 'w') as f:
+                  f.write(sc)
 
+          # Update .vcxproj files (only if they exist)
           vcx = 'duckstation/src/duckstation-qt/duckstation-qt.vcxproj'
-          with open(vcx, 'r') as f:
-              vc = f.read()
-          vc = vc.replace('<ClCompile Include="settingswindow.cpp" />',
-                          '<ClCompile Include="settingswindow.cpp" />\n    <ClCompile Include="sisesettingswidget.cpp" />')
-          vc = vc.replace('<ClInclude Include="settingswindow.h" />',
-                          '<ClInclude Include="settingswindow.h" />\n    <ClInclude Include="sisesettingswidget.h" />')
-          with open(vcx, 'w') as f:
-              f.write(vc)
+          if os.path.exists(vcx):
+              with open(vcx, 'r') as f:
+                  vc = f.read()
+              vc = vc.replace('<ClCompile Include="settingswindow.cpp" />',
+                              '<ClCompile Include="settingswindow.cpp" />\n    <ClCompile Include="sisesettingswidget.cpp" />')
+              vc = vc.replace('<ClInclude Include="settingswindow.h" />',
+                              '<ClInclude Include="settingswindow.h" />\n    <ClInclude Include="sisesettingswidget.h" />')
+              with open(vcx, 'w') as f:
+                  f.write(vc)
 
           core_vcx = 'duckstation/src/core/core.vcxproj'
-          with open(core_vcx, 'r') as f:
-              cvc = f.read()
-          cvc = cvc.replace('<ClCompile Include="gte.cpp" />',
-                            '<ClCompile Include="gte.cpp" />\n    <ClCompile Include="..\\sise\\sie.cpp" />')
-          cvc = cvc.replace('<ClInclude Include="gte.h" />',
-                            '<ClInclude Include="gte.h" />\n    <ClInclude Include="..\\sise\\sie.h" />')
-          with open(core_vcx, 'w') as f:
-              f.write(cvc)
-          print("All SIE patches applied.")
+          if os.path.exists(core_vcx):
+              with open(core_vcx, 'r') as f:
+                  cvc = f.read()
+              cvc = cvc.replace('<ClCompile Include="gte.cpp" />',
+                                '<ClCompile Include="gte.cpp" />\n    <ClCompile Include="..\\sise\\sie.cpp" />')
+              cvc = cvc.replace('<ClInclude Include="gte.h" />',
+                                '<ClInclude Include="gte.h" />\n    <ClInclude Include="..\\sise\\sie.h" />')
+              with open(core_vcx, 'w') as f:
+                  f.write(cvc)
+
+          print("All SIE patches applied successfully.")
 
       - name: Download prebuilt dependencies
         shell: cmd
