@@ -1,0 +1,258 @@
+name: Build DuckStation with SIE Enhanced Draw Distance
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Clone DuckStation
+        run: git clone --depth 1 https://github.com/stenzek/DuckStation.git duckstation
+        shell: cmd
+
+      - name: Apply SIE patches
+        shell: python
+        run: |
+          import os, re
+
+          def patch_file(path, anchor, insertion, after=True):
+              with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                  c = f.read()
+              if insertion.strip() in c:
+                  return
+              i = c.find(anchor)
+              if i < 0:
+                  print(f"WARN: anchor not found in {path}: {anchor[:40]}")
+                  return
+              if after:
+                  i = c.find('\n', i) + 1
+              new_c = c[:i] + insertion + '\n' + c[i:]
+              with open(path, 'w', encoding='utf-8') as f:
+                  f.write(new_c)
+
+          os.makedirs('duckstation/src/sise', exist_ok=True)
+          with open('duckstation/src/sise/sie.h', 'w') as f:
+              f.write('''#pragma once
+          #include "common/types.h"
+          namespace SIE {
+          extern bool g_enabled;
+          extern u32 g_z_scale;
+          struct Settings { bool enabled; float z_scale_factor; bool show_overlay; };
+          class SIEEngine {
+          public:
+              static SIEEngine& Get();
+              void Initialize();
+              void Shutdown();
+              void ReloadSettings();
+              void OnFrameEnd();
+              enum class State : u8 { Disabled, Active };
+              State GetState() const { return m_state; }
+          private:
+              Settings m_settings;
+              State m_state = State::Disabled;
+          };
+          extern "C" u32 SIE_ScaleZ_Helper(u32 idx, u32 value);
+          }  // namespace SIE''')
+          with open('duckstation/src/sise/sie.cpp', 'w') as f:
+              f.write('''#include "sise/sie.h"
+          #include "core/core.h"
+          #include "common/log.h"
+          LOG_CHANNEL(GPU);
+          namespace SIE {
+          bool g_enabled = false;
+          u32 g_z_scale = 1;
+          static SIEEngine s_engine;
+          SIEEngine& SIEEngine::Get() { return s_engine; }
+          void SIEEngine::Initialize() {
+              ReloadSettings();
+              if (!m_settings.enabled) { g_enabled = false; g_z_scale = 1; m_state = State::Disabled; return; }
+              g_enabled = true;
+              g_z_scale = static_cast<u32>(m_settings.z_scale_factor);
+              if (g_z_scale < 1) g_z_scale = 1;
+              m_state = State::Active;
+              INFO_LOG("SIE: Z-scaling active (scale={})", g_z_scale);
+          }
+          void SIEEngine::Shutdown() { g_enabled = false; g_z_scale = 1; m_state = State::Disabled; }
+          void SIEEngine::ReloadSettings() {
+              m_settings.enabled = Core::GetBaseBoolSettingValue("sise", "enabled", false);
+              m_settings.z_scale_factor = Core::GetBaseFloatSettingValue("sise", "z_scale_factor", 4.0f);
+              m_settings.show_overlay = Core::GetBaseBoolSettingValue("sise", "show_overlay", true);
+          }
+          void SIEEngine::OnFrameEnd() {}
+          extern "C" u32 SIE_ScaleZ_Helper(u32 idx, u32 value) {
+              if (!g_enabled || g_z_scale <= 1) return value;
+              if (idx == 7 || (idx >= 16 && idx <= 19)) {
+                  u16 z = static_cast<u16>(value & 0xFFFF);
+                  if (z > 100) {
+                      z = static_cast<u16>(z / g_z_scale);
+                      if (z < 1) z = 1;
+                  }
+                  return (value & 0xFFFF0000) | z;
+              }
+              return value;
+          }
+          }  // namespace SIE''')
+
+          cp = 'duckstation/src/core/cpu_core.cpp'
+          with open(cp, 'r') as f:
+              cc = f.read()
+          cc = cc.replace('#include "gte.h"', '#include "gte.h"\n#include "sise/sie.h"')
+          cc = cc.replace(
+              'const u32 value = GTE::ReadRegister(static_cast<u32>(inst.r.rd.GetValue()));',
+              'const u32 idx = static_cast<u32>(inst.r.rd.GetValue());\n          u32 value = GTE::ReadRegister(idx);\n          u32 scaled_value = value;\n          if (SIE::g_enabled && SIE::g_z_scale > 1) {\n            if (idx == 7 || (idx >= 16 && idx <= 19)) {\n              u16 z = static_cast<u16>(value & 0xFFFF);\n              if (z > 100) {\n                z = static_cast<u16>(z / SIE::g_z_scale);\n                if (z < 1) z = 1;\n              }\n              scaled_value = (value & 0xFFFF0000) | z;\n            }\n          }')
+          cc = cc.replace('WriteRegDelayed(inst.r.rt, value);', 'WriteRegDelayed(inst.r.rt, scaled_value);')
+          cc = cc.replace(
+              'const u32 value = GTE::ReadRegister(ZeroExtend32(static_cast<u8>(inst.i.rt.GetValue())));',
+              'const u32 idx = ZeroExtend32(static_cast<u8>(inst.i.rt.GetValue()));\n          u32 value = GTE::ReadRegister(idx);\n          u32 scaled_value = value;\n          if (SIE::g_enabled && SIE::g_z_scale > 1) {\n            if (idx == 7 || (idx >= 16 && idx <= 19)) {\n              u16 z = static_cast<u16>(value & 0xFFFF);\n              if (z > 100) {\n                z = static_cast<u16>(z / SIE::g_z_scale);\n                if (z < 1) z = 1;\n              }\n              scaled_value = (value & 0xFFFF0000) | z;\n            }\n          }')
+          cc = cc.replace('WriteMemoryWord(addr, value);', 'WriteMemoryWord(addr, scaled_value);')
+          with open(cp, 'w') as f:
+              f.write(cc)
+
+          rc_path = 'duckstation/src/core/cpu_recompiler_codegen.cpp'
+          with open(rc_path, 'r') as f:
+              rc = f.read()
+          rc = rc.replace(
+              'Value val = CallCFunc(&GTE::ReadRegister, MakeRegParam(idx));',
+              'Value original_val = CallCFunc(&GTE::ReadRegister, MakeRegParam(idx));\n              Value val = CallCFunc(&GTE::ScaleZRegister, MakeRegParam(idx), original_val);')
+          rc = rc.replace(
+              'CallCFunc(&PGXP::CPU_MFC2, MakeRegParam(inst.bits), val);',
+              'CallCFunc(&PGXP::CPU_MFC2, MakeRegParam(inst.bits), original_val);')
+          with open(rc_path, 'w') as f:
+              f.write(rc)
+
+          gte_cpp = 'duckstation/src/core/gte.cpp'
+          with open(gte_cpp, 'r') as f:
+              gte = f.read()
+          gte = gte.replace('} // namespace GTE',
+                            'u32 GTE::ScaleZRegister(u32 idx, u32 value) {\n    extern u32 SIE_ScaleZ_Helper(u32, u32);\n    return SIE_ScaleZ_Helper(idx, value);\n}\n} // namespace GTE')
+          if 'const u16 otz = TruncateToU16(m_mac[0] >> 12);' in gte:
+              gte = gte.replace('const u16 otz = TruncateToU16(m_mac[0] >> 12);',
+                                'const u16 otz = TruncateToU16(m_mac[0] >> 12);\n          if (SIE::g_enabled && SIE::g_z_scale > 1) {\n            u32 scaled_otz = otz / SIE::g_z_scale;\n            m_mac[0] = (m_mac[0] & ~0xFFFF) | (scaled_otz & 0xFFFF);\n          }')
+          with open(gte_cpp, 'w') as f:
+              f.write(gte)
+          patch_file('duckstation/src/core/gte.h',
+                     '} // namespace GTE',
+                     'u32 ScaleZRegister(u32 idx, u32 value);\n} // namespace GTE',
+                     after=False)
+
+          ui_h = '''#pragma once
+          #include <QWidget>
+          class QCheckBox; class QLabel; class QSlider;
+          class SIESettingsWidget : public QWidget {
+              Q_OBJECT
+          public:
+              explicit SIESettingsWidget(QWidget* parent = nullptr);
+          private:
+              void updateStatus();
+              QCheckBox* m_enabled;
+              QSlider* m_scaleSlider;
+              QLabel* m_scaleLabel;
+              QLabel* m_statusLabel;
+          };'''
+          ui_cpp = '''#include "sisesettingswidget.h"
+          #include "settingswidgetbinder.h"
+          #include "core/core.h"
+          #include <QCheckBox>
+          #include <QFormLayout>
+          #include <QGroupBox>
+          #include <QHBoxLayout>
+          #include <QLabel>
+          #include <QSlider>
+          #include <QVBoxLayout>
+          SIESettingsWidget::SIESettingsWidget(QWidget* parent) : QWidget(parent) {
+              auto* mainLayout = new QVBoxLayout(this);
+              auto* group = new QGroupBox(tr("Enhanced Draw Distance (SIE)"), this);
+              auto* form = new QFormLayout(group);
+              m_enabled = new QCheckBox(tr("Enable Z-scaling"), group);
+              SettingsWidgetBinder::BindWidgetToBoolSetting(nullptr, m_enabled, "sise", "enabled", true);
+              form->addRow(m_enabled);
+              auto* scaleLayout = new QHBoxLayout();
+              m_scaleSlider = new QSlider(Qt::Horizontal, group);
+              m_scaleSlider->setRange(1, 16);
+              m_scaleSlider->setValue(4);
+              m_scaleLabel = new QLabel("4x", group);
+              m_scaleLabel->setMinimumWidth(40);
+              scaleLayout->addWidget(m_scaleSlider);
+              scaleLayout->addWidget(m_scaleLabel);
+              form->addRow(tr("Multiplier:"), scaleLayout);
+              m_statusLabel = new QLabel(group);
+              m_statusLabel->setWordWrap(true);
+              m_statusLabel->setStyleSheet("padding:8px; background:rgba(0,0,0,0.1); border-radius:4px;");
+              form->addRow(tr("Status:"), m_statusLabel);
+              mainLayout->addWidget(group);
+              mainLayout->addStretch(1);
+              connect(m_enabled, &QCheckBox::toggled, this, &SIESettingsWidget::updateStatus);
+              connect(m_scaleSlider, &QSlider::valueChanged, [this](int v){
+                  m_scaleLabel->setText(QString("%1x").arg(v));
+                  Core::SetBaseFloatSettingValue("sise", "z_scale_factor", (float)v);
+                  updateStatus();
+              });
+              updateStatus();
+          }
+          void SIESettingsWidget::updateStatus() {
+              if (!m_enabled->isChecked())
+                  m_statusLabel->setText(tr("<b style='color:gray'>OFF</b> – Original draw distance."));
+              else
+                  m_statusLabel->setText(tr("<b style='color:green'>ON</b> – Draw distance x%1.").arg(m_scaleSlider->value()));
+          }'''
+          with open('duckstation/src/duckstation-qt/sisesettingswidget.h', 'w') as f:
+              f.write(ui_h)
+          with open('duckstation/src/duckstation-qt/sisesettingswidget.cpp', 'w') as f:
+              f.write(ui_cpp)
+
+          sw = 'duckstation/src/duckstation-qt/settingswindow.cpp'
+          with open(sw, 'r') as f:
+              sc = f.read()
+          sc = sc.replace('#include "graphicssettingswidget.h"',
+                          '#include "sisesettingswidget.h"\n#include "graphicssettingswidget.h"')
+          sc = sc.replace('addWidget(new GraphicsSettingsWidget',
+                          'addWidget(new SIESettingsWidget(m_ui.settingsContainer),\n          tr("Enhanced Draw Distance"),\n          u":/icons/monochrome/svg/eye-line.svg"_s,\n          tr("<strong>Enhanced Draw Distance</strong><hr>Extends draw distance by scaling depth values."));\n  addWidget(new GraphicsSettingsWidget')
+          with open(sw, 'w') as f:
+              f.write(sc)
+
+          vcx = 'duckstation/src/duckstation-qt/duckstation-qt.vcxproj'
+          with open(vcx, 'r') as f:
+              vc = f.read()
+          vc = vc.replace('<ClCompile Include="settingswindow.cpp" />',
+                          '<ClCompile Include="settingswindow.cpp" />\n    <ClCompile Include="sisesettingswidget.cpp" />')
+          vc = vc.replace('<ClInclude Include="settingswindow.h" />',
+                          '<ClInclude Include="settingswindow.h" />\n    <ClInclude Include="sisesettingswidget.h" />')
+          with open(vcx, 'w') as f:
+              f.write(vc)
+
+          core_vcx = 'duckstation/src/core/core.vcxproj'
+          with open(core_vcx, 'r') as f:
+              cvc = f.read()
+          cvc = cvc.replace('<ClCompile Include="gte.cpp" />',
+                            '<ClCompile Include="gte.cpp" />\n    <ClCompile Include="..\\sise\\sie.cpp" />')
+          cvc = cvc.replace('<ClInclude Include="gte.h" />',
+                            '<ClInclude Include="gte.h" />\n    <ClInclude Include="..\\sise\\sie.h" />')
+          with open(core_vcx, 'w') as f:
+              f.write(cvc)
+          print("All SIE patches applied.")
+
+      - name: Download prebuilt dependencies
+        shell: cmd
+        run: |
+          curl -sL -o deps.7z "https://github.com/duckstation/dependencies/releases/download/v0.1-30/deps-windows-x64.7z"
+          mkdir duckstation\dep\prebuilt
+          7z x deps.7z -oduckstation\dep\prebuilt -y
+
+      - name: Build
+        shell: powershell
+        run: |
+          $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe
+          cd duckstation
+          & $msbuild duckstation.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /m
+
+      - name: Package
+        shell: cmd
+        run: |
+          echo. > duckstation\bin\x64\portable.txt
+          (echo [sise] && echo enabled=true && echo z_scale_factor=4.0 && echo show_overlay=true) > duckstation\bin\x64\settings.ini
+          7z a duckstation-sie.7z duckstation\bin\x64\*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: duckstation-sie
+          path: duckstation-sie.7z
