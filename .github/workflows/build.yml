@@ -31,7 +31,6 @@ jobs:
               with open(path, 'w', encoding='utf-8') as f:
                   f.write(new_c)
 
-          # 1. Create SIE engine files
           os.makedirs('duckstation/src/sise', exist_ok=True)
           with open('duckstation/src/sise/sie.h', 'w') as f:
               f.write('''#pragma once
@@ -95,7 +94,7 @@ jobs:
           }
           }  // namespace SIE''')
 
-          # 2. Patch interpreter (cpu_core.cpp)
+          # interpreter patch
           cp = 'duckstation/src/core/cpu_core.cpp'
           with open(cp, 'r') as f:
               cc = f.read()
@@ -111,7 +110,7 @@ jobs:
           with open(cp, 'w') as f:
               f.write(cc)
 
-          # 3. Patch recompiler – search for the correct file
+          # recompiler patch (find correct file)
           rc_path = None
           for candidate in ['duckstation/src/core/cpu_recompiler_codegen.cpp',
                             'duckstation/src/core/cpu_recompiler_codegen_x86.cpp',
@@ -134,7 +133,7 @@ jobs:
           else:
               print("WARNING: Recompiler file not found; SIE will work in interpreter only.")
 
-          # 4. Patch GTE (OTZ scaling)
+          # GTE patch
           gte_cpp = 'duckstation/src/core/gte.cpp'
           with open(gte_cpp, 'r') as f:
               gte = f.read()
@@ -150,7 +149,7 @@ jobs:
                      'u32 ScaleZRegister(u32 idx, u32 value);\n} // namespace GTE',
                      after=False)
 
-          # 5. Add UI widget
+          # UI widget
           ui_h = '''#pragma once
           #include <QWidget>
           class QCheckBox; class QLabel; class QSlider;
@@ -216,7 +215,7 @@ jobs:
           with open('duckstation/src/duckstation-qt/sisesettingswidget.cpp', 'w') as f:
               f.write(ui_cpp)
 
-          # Register widget in settingswindow.cpp
+          # Register widget
           sw = 'duckstation/src/duckstation-qt/settingswindow.cpp'
           if os.path.exists(sw):
               with open(sw, 'r') as f:
@@ -228,7 +227,7 @@ jobs:
               with open(sw, 'w') as f:
                   f.write(sc)
 
-          # Update .vcxproj files (only if they exist)
+          # Update project files
           vcx = 'duckstation/src/duckstation-qt/duckstation-qt.vcxproj'
           if os.path.exists(vcx):
               with open(vcx, 'r') as f:
@@ -250,14 +249,13 @@ jobs:
                                 '<ClInclude Include="gte.h" />\n    <ClInclude Include="..\\sise\\sie.h" />')
               with open(core_vcx, 'w') as f:
                   f.write(cvc)
-
-          print("All SIE patches applied successfully.")
+          print("All SIE patches applied.")
 
       - name: Download prebuilt dependencies
         shell: cmd
         run: |
-          curl -sL -o deps.7z "https://github.com/duckstation/dependencies/releases/download/v0.1-30/deps-windows-x64.7z"
-          mkdir duckstation\dep\prebuilt
+          curl -sL -o deps.7z "https://github.com/duckstation/dependencies/releases/latest/download/deps-windows-x64.7z"
+          mkdir duckstation\dep\prebuilt 2>nul
           7z x deps.7z -oduckstation\dep\prebuilt -y
 
       - name: Build
