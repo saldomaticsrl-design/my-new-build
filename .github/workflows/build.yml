@@ -9,14 +9,12 @@ jobs:
         run: git clone --depth 1 https://github.com/stenzek/DuckStation.git duckstation
         shell: cmd
 
-      - name: Apply SIE patches
+      - name: Apply SIE core patches
         shell: python
         run: |
           import os, re
 
-          # ------------------------------------------------------------
-          # 1. Create the SIE helper library (sie.h / sie.cpp)
-          # ------------------------------------------------------------
+          # 1. Create SIE helper library (sie.h / sie.cpp)
           os.makedirs('duckstation/src/sise', exist_ok=True)
 
           with open('duckstation/src/sise/sie.h', 'w') as f:
@@ -48,9 +46,7 @@ jobs:
           }
           """)
 
-          # ------------------------------------------------------------
-          # 2. Patch cpu_core.cpp – interpreter blocks
-          # ------------------------------------------------------------
+          # 2. Patch cpu_core.cpp (interpreter)
           cp_path = 'duckstation/src/core/cpu_core.cpp'
           with open(cp_path, 'r') as f:
               lines = f.readlines()
@@ -95,9 +91,7 @@ jobs:
           with open(cp_path, 'w') as f:
               f.writelines(lines)
 
-          # ------------------------------------------------------------
-          # 3. Patch gte.cpp – OTZ scaling + recompiler helper
-          # ------------------------------------------------------------
+          # 3. Patch gte.cpp (OTZ scaling + recompiler helper)
           gte_path = 'duckstation/src/core/gte.cpp'
           with open(gte_path, 'r') as f:
               gte = f.read()
@@ -122,9 +116,7 @@ jobs:
           with open(gte_path, 'w') as f:
               f.write(gte)
 
-          # ------------------------------------------------------------
           # 4. Recompiler patch (if file exists)
-          # ------------------------------------------------------------
           rc_path = None
           for candidate in ['duckstation/src/core/cpu_recompiler_codegen.cpp',
                             'duckstation/src/core/cpu_recompiler_codegen_x86.cpp',
@@ -145,121 +137,7 @@ jobs:
               with open(rc_path, 'w') as f:
                   f.write(rc)
 
-          # ------------------------------------------------------------
-          # 5. UI widget (checkbox + slider)
-          # ------------------------------------------------------------
-          ui_h = 'duckstation/src/duckstation-qt/sisesettingswidget.h'
-          with open(ui_h, 'w') as f:
-              f.write("""#pragma once
-          #include <QWidget>
-
-          class QCheckBox;
-          class QLabel;
-          class QSlider;
-
-          class SIESettingsWidget : public QWidget
-          {
-              Q_OBJECT
-          public:
-              explicit SIESettingsWidget(QWidget* parent = nullptr);
-          private:
-              void updateStatus();
-              QCheckBox* m_enabled;
-              QSlider* m_scaleSlider;
-              QLabel* m_scaleLabel;
-              QLabel* m_statusLabel;
-          };""")
-
-          ui_cpp = 'duckstation/src/duckstation-qt/sisesettingswidget.cpp'
-          with open(ui_cpp, 'w') as f:
-              f.write('''#include "pch.h"
-          #include "sisesettingswidget.h"
-          #include "settingswidgetbinder.h"
-          #include "core/core.h"
-          #include <QCheckBox>
-          #include <QFormLayout>
-          #include <QGroupBox>
-          #include <QHBoxLayout>
-          #include <QLabel>
-          #include <QSlider>
-          #include <QVBoxLayout>
-
-          SIESettingsWidget::SIESettingsWidget(QWidget* parent)
-              : QWidget(parent)
-          {
-              auto* mainLayout = new QVBoxLayout(this);
-              auto* group = new QGroupBox(tr("Enhanced Draw Distance (SIE)"), this);
-              auto* form = new QFormLayout(group);
-
-              m_enabled = new QCheckBox(tr("Enable Z-scaling"), group);
-              SettingsWidgetBinder::BindWidgetToBoolSetting(nullptr, m_enabled, "sise", "enabled", true);
-              form->addRow(m_enabled);
-
-              auto* scaleLayout = new QHBoxLayout();
-              m_scaleSlider = new QSlider(Qt::Horizontal, group);
-              m_scaleSlider->setRange(1, 16);
-              m_scaleSlider->setValue(4);
-              m_scaleLabel = new QLabel("4x", group);
-              m_scaleLabel->setMinimumWidth(40);
-              scaleLayout->addWidget(m_scaleSlider);
-              scaleLayout->addWidget(m_scaleLabel);
-              form->addRow(tr("Multiplier:"), scaleLayout);
-
-              m_statusLabel = new QLabel(group);
-              m_statusLabel->setWordWrap(true);
-              m_statusLabel->setStyleSheet("padding:8px; background:rgba(0,0,0,0.1); border-radius:4px;");
-              form->addRow(tr("Status:"), m_statusLabel);
-
-              mainLayout->addWidget(group);
-              mainLayout->addStretch(1);
-
-              connect(m_enabled, &QCheckBox::toggled, this, &SIESettingsWidget::updateStatus);
-              connect(m_scaleSlider, &QSlider::valueChanged, [this](int v) {
-                  m_scaleLabel->setText(QString("%1x").arg(v));
-                  Core::SetBaseFloatSettingValue("sise", "z_scale_factor", static_cast<float>(v));
-                  updateStatus();
-              });
-
-              updateStatus();
-          }
-
-          void SIESettingsWidget::updateStatus()
-          {
-              if (!m_enabled->isChecked())
-                  m_statusLabel->setText(tr("<b style='color:gray'>OFF</b> – Original draw distance."));
-              else
-                  m_statusLabel->setText(tr("<b style='color:green'>ON</b> – Draw distance x%1.").arg(m_scaleSlider->value()));
-          }''')
-
-          # Register widget in settingswindow.cpp
-          sw = 'duckstation/src/duckstation-qt/settingswindow.cpp'
-          if os.path.exists(sw):
-              with open(sw, 'r') as f:
-                  sc = f.read()
-              sc = sc.replace('#include "graphicssettingswidget.h"',
-                              '#include "sisesettingswidget.h"\n#include "graphicssettingswidget.h"')
-              sc = sc.replace('addWidget(new GraphicsSettingsWidget',
-                              'addWidget(new SIESettingsWidget(m_ui.settingsContainer),\n'
-                              '          tr("Enhanced Draw Distance"),\n'
-                              '          u":/icons/monochrome/svg/eye-line.svg"_s,\n'
-                              '          tr("<strong>Enhanced Draw Distance</strong><hr>'
-                              'Extends draw distance by scaling depth values."));\n'
-                              '  addWidget(new GraphicsSettingsWidget')
-              with open(sw, 'w') as f:
-                  f.write(sc)
-
-          # Update .vcxproj files
-          vcx = 'duckstation/src/duckstation-qt/duckstation-qt.vcxproj'
-          if os.path.exists(vcx):
-              with open(vcx, 'r') as f:
-                  vc = f.read()
-              vc = vc.replace('<ClCompile Include="settingswindow.cpp" />',
-                              '<ClCompile Include="settingswindow.cpp" />\n    <ClCompile Include="sisesettingswidget.cpp" />')
-              vc = vc.replace('<ClInclude Include="settingswindow.h" />',
-                              '<ClInclude Include="settingswindow.h" />\n    <ClInclude Include="sisesettingswidget.h" />')
-              with open(vcx, 'w') as f:
-                  f.write(vc)
-
+          # 5. Add SIE files to core.vcxproj
           core_vcx = 'duckstation/src/core/core.vcxproj'
           if os.path.exists(core_vcx):
               with open(core_vcx, 'r') as f:
@@ -271,7 +149,71 @@ jobs:
               with open(core_vcx, 'w') as f:
                   f.write(cvc)
 
-          print("All SIE patches applied successfully.")
+      - name: Add UI to settingswindow.cpp (no new files)
+        shell: python
+        run: |
+          import re
+
+          sw_path = 'duckstation/src/duckstation-qt/settingswindow.cpp'
+          with open(sw_path, 'r') as f:
+              sw = f.read()
+
+          # 1. Add #include <QSlider> if not present (needed for the slider)
+          if '#include <QSlider>' not in sw:
+              sw = sw.replace('#include <QCheckBox>', '#include <QCheckBox>\n#include <QSlider>')
+
+          # 2. Add a helper function that creates the SIE group widget.
+          #    We'll insert it right before the line that adds GraphicsSettingsWidget.
+          insert_code = '''
+          {
+              // Enhanced Draw Distance (SIE)
+              auto* sieGroup = new QGroupBox(tr("Enhanced Draw Distance"), container);
+              auto* sieForm = new QFormLayout(sieGroup);
+
+              auto* sieEnabled = new QCheckBox(tr("Enable Z-scaling"), sieGroup);
+              SettingsWidgetBinder::BindWidgetToBoolSetting(nullptr, sieEnabled, "sise", "enabled", true);
+              sieForm->addRow(sieEnabled);
+
+              auto* scaleLayout = new QHBoxLayout();
+              auto* scaleSlider = new QSlider(Qt::Horizontal, sieGroup);
+              scaleSlider->setRange(1, 16);
+              scaleSlider->setValue(static_cast<int>(Core::GetBaseFloatSettingValue("sise", "z_scale_factor", 4.0f)));
+              auto* scaleLabel = new QLabel("4x", sieGroup);
+              scaleLabel->setMinimumWidth(40);
+              scaleLayout->addWidget(scaleSlider);
+              scaleLayout->addWidget(scaleLabel);
+              sieForm->addRow(tr("Multiplier:"), scaleLayout);
+
+              auto* statusLabel = new QLabel(sieGroup);
+              statusLabel->setWordWrap(true);
+              statusLabel->setStyleSheet("padding:8px; background:rgba(0,0,0,0.1); border-radius:4px;");
+              sieForm->addRow(tr("Status:"), statusLabel);
+
+              auto updateStatus = [scaleSlider, sieEnabled, statusLabel]() {
+                  if (!sieEnabled->isChecked())
+                      statusLabel->setText(tr("<b style='color:gray'>OFF</b> – Original draw distance."));
+                  else
+                      statusLabel->setText(tr("<b style='color:green'>ON</b> – Draw distance x%1.").arg(scaleSlider->value()));
+              };
+              updateStatus();
+              QObject::connect(sieEnabled, &QCheckBox::toggled, updateStatus);
+              QObject::connect(scaleSlider, &QSlider::valueChanged, [scaleSlider, scaleLabel, updateStatus](int v) {
+                  scaleLabel->setText(QString("%1x").arg(v));
+                  Core::SetBaseFloatSettingValue("sise", "z_scale_factor", static_cast<float>(v));
+                  updateStatus();
+              });
+
+              static_cast<QVBoxLayout*>(container->layout())->addWidget(sieGroup);
+          }
+          '''
+
+          # Insert this code right before the first `addWidget(new GraphicsSettingsWidget` line
+          # to place the SIE group at the top of the Enhancements page.
+          sw = sw.replace('addWidget(new GraphicsSettingsWidget',
+                          insert_code + '\n  addWidget(new GraphicsSettingsWidget')
+
+          with open(sw_path, 'w') as f:
+              f.write(sw)
 
       - name: Download prebuilt dependencies
         shell: cmd
