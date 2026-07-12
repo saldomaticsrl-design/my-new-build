@@ -55,7 +55,6 @@ jobs:
           with open(cp_path, 'r') as f:
               lines = f.readlines()
 
-          # Insert the SIE include after the existing gte.h include
           new_lines = []
           for line in lines:
               new_lines.append(line)
@@ -63,29 +62,21 @@ jobs:
                   new_lines.append('#include "sise/sie.h"\n')
           lines = new_lines
 
-          # Helper to patch a block identified by a case label
           def patch_block(case_label, read_pattern, write_pattern, lines_list):
-              """Surgically insert scaled_value inside a case block."""
               in_block = False
               result = []
-              for i, line in enumerate(lines_list):
-                  # Enter block when we see the case label
+              for line in lines_list:
                   if case_label in line:
                       in_block = True
-                  # Leave block when next case or default is encountered
                   elif line.strip().startswith(('case ', 'default:')) and in_block:
                       in_block = False
 
                   if in_block and read_pattern in line:
-                      # Capture indentation
                       indent = line[:len(line) - len(line.lstrip())]
-                      # Keep original line
                       result.append(line)
-                      # Add scaling lines
                       result.append(f'{indent}u32 scaled_value = value;\n')
                       result.append(f'{indent}SIE::ScaleGTERegister(static_cast<u32>(inst.r.rd.GetValue()), scaled_value);\n')
                   elif in_block and write_pattern in line:
-                      # Replace 'value' with 'scaled_value' in the write call
                       result.append(line.replace('value', 'scaled_value'))
                   else:
                       result.append(line)
@@ -111,10 +102,8 @@ jobs:
           with open(gte_path, 'r') as f:
               gte = f.read()
 
-          # Add SIE include
           gte = gte.replace('#include "gte.h"', '#include "gte.h"\n#include "sise/sie.h"')
 
-          # Add ScaleZRegister function for the recompiler
           if 'ScaleZRegister' not in gte:
               gte = gte.replace('} // namespace GTE',
                                 'u32 ScaleZRegister(u32 idx, u32 value) {\n'
@@ -123,7 +112,6 @@ jobs:
                                 '}\n'
                                 '} // namespace GTE')
 
-          # OTZ scaling inside RTPS / RTPT
           if 'const u16 otz = TruncateToU16(m_mac[0] >> 12);' in gte:
               gte = gte.replace('const u16 otz = TruncateToU16(m_mac[0] >> 12);',
                                 'const u16 otz = TruncateToU16(m_mac[0] >> 12);\n'
@@ -158,16 +146,19 @@ jobs:
                   f.write(rc)
 
           # ------------------------------------------------------------
-          # 5. UI widget (Enhanced Draw Distance settings page)
+          # 5. UI widget (checkbox + slider) with correct precompiled header
           # ------------------------------------------------------------
           ui_h = 'duckstation/src/duckstation-qt/sisesettingswidget.h'
           with open(ui_h, 'w') as f:
               f.write("""#pragma once
           #include <QWidget>
+
           class QCheckBox;
           class QLabel;
           class QSlider;
-          class SIESettingsWidget : public QWidget {
+
+          class SIESettingsWidget : public QWidget
+          {
               Q_OBJECT
           public:
               explicit SIESettingsWidget(QWidget* parent = nullptr);
@@ -181,7 +172,8 @@ jobs:
 
           ui_cpp = 'duckstation/src/duckstation-qt/sisesettingswidget.cpp'
           with open(ui_cpp, 'w') as f:
-              f.write('''#include "sisesettingswidget.h"
+              f.write('''#include "pch.h"
+          #include "sisesettingswidget.h"
           #include "settingswidgetbinder.h"
           #include "core/core.h"
           #include <QCheckBox>
@@ -191,13 +183,18 @@ jobs:
           #include <QLabel>
           #include <QSlider>
           #include <QVBoxLayout>
-          SIESettingsWidget::SIESettingsWidget(QWidget* parent) : QWidget(parent) {
+
+          SIESettingsWidget::SIESettingsWidget(QWidget* parent)
+              : QWidget(parent)
+          {
               auto* mainLayout = new QVBoxLayout(this);
               auto* group = new QGroupBox(tr("Enhanced Draw Distance (SIE)"), this);
               auto* form = new QFormLayout(group);
+
               m_enabled = new QCheckBox(tr("Enable Z-scaling"), group);
               SettingsWidgetBinder::BindWidgetToBoolSetting(nullptr, m_enabled, "sise", "enabled", true);
               form->addRow(m_enabled);
+
               auto* scaleLayout = new QHBoxLayout();
               m_scaleSlider = new QSlider(Qt::Horizontal, group);
               m_scaleSlider->setRange(1, 16);
@@ -207,21 +204,27 @@ jobs:
               scaleLayout->addWidget(m_scaleSlider);
               scaleLayout->addWidget(m_scaleLabel);
               form->addRow(tr("Multiplier:"), scaleLayout);
+
               m_statusLabel = new QLabel(group);
               m_statusLabel->setWordWrap(true);
               m_statusLabel->setStyleSheet("padding:8px; background:rgba(0,0,0,0.1); border-radius:4px;");
               form->addRow(tr("Status:"), m_statusLabel);
+
               mainLayout->addWidget(group);
               mainLayout->addStretch(1);
+
               connect(m_enabled, &QCheckBox::toggled, this, &SIESettingsWidget::updateStatus);
-              connect(m_scaleSlider, &QSlider::valueChanged, [this](int v){
+              connect(m_scaleSlider, &QSlider::valueChanged, [this](int v) {
                   m_scaleLabel->setText(QString("%1x").arg(v));
-                  Core::SetBaseFloatSettingValue("sise", "z_scale_factor", (float)v);
+                  Core::SetBaseFloatSettingValue("sise", "z_scale_factor", static_cast<float>(v));
                   updateStatus();
               });
+
               updateStatus();
           }
-          void SIESettingsWidget::updateStatus() {
+
+          void SIESettingsWidget::updateStatus()
+          {
               if (!m_enabled->isChecked())
                   m_statusLabel->setText(tr("<b style='color:gray'>OFF</b> – Original draw distance."));
               else
@@ -245,7 +248,7 @@ jobs:
               with open(sw, 'w') as f:
                   f.write(sc)
 
-          # Update project files (.vcxproj)
+          # Update .vcxproj files
           vcx = 'duckstation/src/duckstation-qt/duckstation-qt.vcxproj'
           if os.path.exists(vcx):
               with open(vcx, 'r') as f:
