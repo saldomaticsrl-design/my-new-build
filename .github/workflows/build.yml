@@ -149,71 +149,73 @@ jobs:
               with open(core_vcx, 'w') as f:
                   f.write(cvc)
 
-      - name: Add UI to settingswindow.cpp (no new files)
+          print("SIE core patches applied.")
+
+      - name: Add ImGui overlay for SIE controls
         shell: python
         run: |
-          import re
+          imgui_path = 'duckstation/src/core/imgui_overlays.cpp'
+          with open(imgui_path, 'r') as f:
+              content = f.read()
 
-          sw_path = 'duckstation/src/duckstation-qt/settingswindow.cpp'
-          with open(sw_path, 'r') as f:
-              sw = f.read()
-
-          # 1. Add #include <QSlider> if not present (needed for the slider)
-          if '#include <QSlider>' not in sw:
-              sw = sw.replace('#include <QCheckBox>', '#include <QCheckBox>\n#include <QSlider>')
-
-          # 2. Add a helper function that creates the SIE group widget.
-          #    We'll insert it right before the line that adds GraphicsSettingsWidget.
-          insert_code = '''
+          # We'll add a new overlay function that draws the SIE window.
+          # Insert it just before the end of the file, before the final closing brace of the namespace.
+          overlay_code = '''
+          void DrawSIEWindow()
           {
-              // Enhanced Draw Distance (SIE)
-              auto* sieGroup = new QGroupBox(tr("Enhanced Draw Distance"), container);
-              auto* sieForm = new QFormLayout(sieGroup);
+              if (!g_gpu_settings.display_show_osd)
+                  return;
 
-              auto* sieEnabled = new QCheckBox(tr("Enable Z-scaling"), sieGroup);
-              SettingsWidgetBinder::BindWidgetToBoolSetting(nullptr, sieEnabled, "sise", "enabled", true);
-              sieForm->addRow(sieEnabled);
+              ImGui::SetNextWindowSize(ImVec2(300, 150), ImGuiCond_FirstUseEver);
+              if (ImGui::Begin("Enhanced Draw Distance (SIE)", nullptr, ImGuiWindowFlags_NoCollapse))
+              {
+                  bool enabled = SIE::g_enabled;
+                  if (ImGui::Checkbox("Enable Z-scaling", &enabled))
+                  {
+                      SIE::g_enabled = enabled;
+                      Core::SetBaseBoolSettingValue("sise", "enabled", enabled);
+                  }
 
-              auto* scaleLayout = new QHBoxLayout();
-              auto* scaleSlider = new QSlider(Qt::Horizontal, sieGroup);
-              scaleSlider->setRange(1, 16);
-              scaleSlider->setValue(static_cast<int>(Core::GetBaseFloatSettingValue("sise", "z_scale_factor", 4.0f)));
-              auto* scaleLabel = new QLabel("4x", sieGroup);
-              scaleLabel->setMinimumWidth(40);
-              scaleLayout->addWidget(scaleSlider);
-              scaleLayout->addWidget(scaleLabel);
-              sieForm->addRow(tr("Multiplier:"), scaleLayout);
+                  int scale = static_cast<int>(SIE::g_z_scale);
+                  ImGui::SliderInt("Multiplier", &scale, 1, 16);
+                  if (scale != static_cast<int>(SIE::g_z_scale))
+                  {
+                      SIE::g_z_scale = static_cast<unsigned>(scale);
+                      Core::SetBaseFloatSettingValue("sise", "z_scale_factor", static_cast<float>(scale));
+                  }
 
-              auto* statusLabel = new QLabel(sieGroup);
-              statusLabel->setWordWrap(true);
-              statusLabel->setStyleSheet("padding:8px; background:rgba(0,0,0,0.1); border-radius:4px;");
-              sieForm->addRow(tr("Status:"), statusLabel);
-
-              auto updateStatus = [scaleSlider, sieEnabled, statusLabel]() {
-                  if (!sieEnabled->isChecked())
-                      statusLabel->setText(tr("<b style='color:gray'>OFF</b> – Original draw distance."));
-                  else
-                      statusLabel->setText(tr("<b style='color:green'>ON</b> – Draw distance x%1.").arg(scaleSlider->value()));
-              };
-              updateStatus();
-              QObject::connect(sieEnabled, &QCheckBox::toggled, updateStatus);
-              QObject::connect(scaleSlider, &QSlider::valueChanged, [scaleSlider, scaleLabel, updateStatus](int v) {
-                  scaleLabel->setText(QString("%1x").arg(v));
-                  Core::SetBaseFloatSettingValue("sise", "z_scale_factor", static_cast<float>(v));
-                  updateStatus();
-              });
-
-              static_cast<QVBoxLayout*>(container->layout())->addWidget(sieGroup);
+                  ImGui::Text("Status: %s (x%d)",
+                              SIE::g_enabled ? "ON" : "OFF",
+                              SIE::g_enabled ? SIE::g_z_scale : 1);
+              }
+              ImGui::End();
           }
           '''
 
-          # Insert this code right before the first `addWidget(new GraphicsSettingsWidget` line
-          # to place the SIE group at the top of the Enhancements page.
-          sw = sw.replace('addWidget(new GraphicsSettingsWidget',
-                          insert_code + '\n  addWidget(new GraphicsSettingsWidget')
+          # Insert the function before the last closing brace of the namespace.
+          # We'll find the last occurrence of '}' and place the function before it.
+          last_brace = content.rfind('}')
+          content = content[:last_brace] + overlay_code + '\n' + content[last_brace:]
 
-          with open(sw_path, 'w') as f:
-              f.write(sw)
+          # Now we need to call DrawSIEWindow from the existing DrawOSD function.
+          # Find a line that calls other overlay windows (e.g., DrawInputsOverlay).
+          # A common pattern: if (show_inputs) DrawInputsOverlay();
+          # We'll add a call after that.
+          content = content.replace(
+              'DrawInputsOverlay();',
+              'DrawInputsOverlay();\n  DrawSIEWindow();'
+          )
+
+          with open(imgui_path, 'w') as f:
+              f.write(content)
+
+          # Also add the include for SIE header at the top of the file.
+          content = content.replace(
+              '#include "common/log.h"',
+              '#include "common/log.h"\n#include "sise/sie.h"'
+          )
+          with open(imgui_path, 'w') as f:
+              f.write(content)
 
       - name: Download prebuilt dependencies
         shell: cmd
