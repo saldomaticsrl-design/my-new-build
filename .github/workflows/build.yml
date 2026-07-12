@@ -146,7 +146,7 @@ jobs:
                   f.write(rc)
 
           # ------------------------------------------------------------
-          # 5. UI widget (checkbox + slider) with correct precompiled header
+          # 5. UI widget (checkbox + slider)
           # ------------------------------------------------------------
           ui_h = 'duckstation/src/duckstation-qt/sisesettingswidget.h'
           with open(ui_h, 'w') as f:
