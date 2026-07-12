@@ -45,14 +45,20 @@ jobs:
           '''
           cc = cc.replace('#include "gte.h"', '#include "gte.h"\n' + sie_impl)
 
+          # Replace MFC2 read (non-const value, then scale)
           cc = cc.replace(
               'const u32 value = GTE::ReadRegister(static_cast<u32>(inst.r.rd.GetValue()));',
-              'const u32 value = GTE::ReadRegister(static_cast<u32>(inst.r.rd.GetValue()));\n          SIE::ScaleRegister(static_cast<u32>(inst.r.rd.GetValue()), value);'
+              '''u32 value = GTE::ReadRegister(static_cast<u32>(inst.r.rd.GetValue()));
+          SIE::ScaleRegister(static_cast<u32>(inst.r.rd.GetValue()), value);'''
           )
+
+          # Replace SWC2 read
           cc = cc.replace(
               'const u32 value = GTE::ReadRegister(ZeroExtend32(static_cast<u8>(inst.i.rt.GetValue())));',
-              'const u32 value = GTE::ReadRegister(ZeroExtend32(static_cast<u8>(inst.i.rt.GetValue())));\n          SIE::ScaleRegister(ZeroExtend32(static_cast<u8>(inst.i.rt.GetValue())), value);'
+              '''u32 value = GTE::ReadRegister(ZeroExtend32(static_cast<u8>(inst.i.rt.GetValue())));
+          SIE::ScaleRegister(ZeroExtend32(static_cast<u8>(inst.i.rt.GetValue())), value);'''
           )
+
           with open(cp, 'w') as f:
               f.write(cc)
 
@@ -63,10 +69,10 @@ jobs:
           with open(imgui, 'r') as f:
               ic = f.read()
 
-          # Add bus.h include
+          # Add bus.h include (needed for Bus::g_ram)
           ic = ic.replace('#include "common/log.h"', '#include "common/log.h"\n#include "bus.h"')
 
-          # MIPS patcher code (placed at the beginning of the file, after includes)
+          # MIPS patcher code
           patcher_code = '''
           // ----- MIPS auto-patcher for draw distance -----
           namespace DrawDistancePatcher {
@@ -121,11 +127,10 @@ jobs:
               int  GetPatchCount() { return s_patch_count; }
           }
           '''
-
-          # Insert patcher code after includes block (use a fixed anchor)
+          # Insert patcher code after the bus.h include
           ic = ic.replace('#include "bus.h"', '#include "bus.h"\n' + patcher_code)
 
-          # Add the ImGui window function (append at the very end)
+          # ImGui window appended at the end of the file
           overlay_window = '''
           void DrawEnhancedDrawDistanceWindow()
           {
@@ -155,10 +160,9 @@ jobs:
               ImGui::End();
           }
           '''
-          ic += overlay_window   # add at the end of the file
+          ic += overlay_window
 
-          # Now insert the call to DrawEnhancedDrawDistanceWindow inside the existing overlay loop.
-          # We'll locate the line that draws another overlay (DrawInputsOverlay) and add after it.
+          # Insert a call to the new window in the overlay loop (after DrawInputsOverlay)
           ic = ic.replace('DrawInputsOverlay();', 'DrawInputsOverlay();\n  DrawEnhancedDrawDistanceWindow();')
 
           with open(imgui, 'w') as f:
