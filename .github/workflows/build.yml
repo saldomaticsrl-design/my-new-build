@@ -12,157 +12,131 @@ jobs:
       - name: Apply SIE patches
         shell: python
         run: |
-          import os
+          import os, re
 
+          # ------------------------------------------------------------
+          # 1. Create the SIE helper library (sie.h / sie.cpp)
+          # ------------------------------------------------------------
           os.makedirs('duckstation/src/sise', exist_ok=True)
 
-          # Write sie.h (clean, no base64)
-          with open('duckstation/src/sise/sie.h', 'w', encoding='utf-8', newline='\n') as f:
-              f.write('''#pragma once
-          #include "common/types.h"
+          with open('duckstation/src/sise/sie.h', 'w') as f:
+              f.write("""#pragma once
           namespace SIE {
-          extern bool g_enabled;
-          extern u32 g_z_scale;
-          struct Settings {
-              bool enabled = false;
-              float z_scale_factor = 4.0f;
-              bool show_overlay = true;
-          };
-          class SIEEngine {
-          public:
-              static SIEEngine& Get();
-              void Initialize();
-              void Shutdown();
-              void ReloadSettings();
-              void OnFrameEnd();
-              enum class State : u8 { Disabled, Active };
-              State GetState() const { return m_state; }
-          private:
-              Settings m_settings;
-              State m_state = State::Disabled;
-          };
+              extern bool g_enabled;
+              extern unsigned g_z_scale;
+              void ScaleGTERegister(unsigned idx, unsigned& value);
           }
-          extern "C" u32 SIE_ScaleZ_Helper(u32 idx, u32 value);
-          ''')
+          """)
 
-          # Write sie.cpp
-          with open('duckstation/src/sise/sie.cpp', 'w', encoding='utf-8', newline='\n') as f:
-              f.write('''#include "sise/sie.h"
+          with open('duckstation/src/sise/sie.cpp', 'w') as f:
+              f.write("""#include "sise/sie.h"
           #include "core/core.h"
-          #include "common/log.h"
-          LOG_CHANNEL(GPU);
           namespace SIE {
-          bool g_enabled = false;
-          u32 g_z_scale = 1;
-          static SIEEngine s_engine;
-          SIEEngine& SIEEngine::Get() { return s_engine; }
-          void SIEEngine::Initialize() {
-              ReloadSettings();
-              if (!m_settings.enabled) {
-                  g_enabled = false;
-                  g_z_scale = 1;
-                  m_state = State::Disabled;
-                  return;
-              }
-              g_enabled = true;
-              g_z_scale = static_cast<u32>(m_settings.z_scale_factor);
-              if (g_z_scale < 1) g_z_scale = 1;
-              m_state = State::Active;
-              INFO_LOG("SIE: Z-scaling active (scale={})", g_z_scale);
-          }
-          void SIEEngine::Shutdown() {
-              g_enabled = false;
-              g_z_scale = 1;
-              m_state = State::Disabled;
-          }
-          void SIEEngine::ReloadSettings() {
-              m_settings.enabled = Core::GetBaseBoolSettingValue("sise", "enabled", false);
-              m_settings.z_scale_factor = Core::GetBaseFloatSettingValue("sise", "z_scale_factor", 4.0f);
-              m_settings.show_overlay = Core::GetBaseBoolSettingValue("sise", "show_overlay", true);
-          }
-          void SIEEngine::OnFrameEnd() {}
-          extern "C" u32 SIE_ScaleZ_Helper(u32 idx, u32 value) {
-              if (!g_enabled || g_z_scale <= 1) return value;
-              if (idx == 7 || (idx >= 16 && idx <= 19)) {
-                  u16 z = static_cast<u16>(value & 0xFFFF);
-                  if (z > 100) {
-                      z = static_cast<u16>(z / g_z_scale);
-                      if (z < 1) z = 1;
+              bool g_enabled = false;
+              unsigned g_z_scale = 1;
+              void ScaleGTERegister(unsigned idx, unsigned& value) {
+                  if (!g_enabled || g_z_scale <= 1) return;
+                  if (idx == 7 || (idx >= 16 && idx <= 19)) {
+                      unsigned z = value & 0xFFFF;
+                      if (z > 100) {
+                          z /= g_z_scale;
+                          if (z < 1) z = 1;
+                      }
+                      value = (value & 0xFFFF0000) | (z & 0xFFFF);
                   }
-                  return (value & 0xFFFF0000) | z;
               }
-              return value;
           }
-          }
-          ''')
+          """)
 
-          # Patch cpu_core.cpp
-          cp = 'duckstation/src/core/cpu_core.cpp'
-          with open(cp, 'r') as f:
-              cc = f.read()
-          cc = cc.replace('#include "gte.h"', '#include "gte.h"\n#include "sise/sie.h"')
-          # MFC2 (read)
-          old1 = 'const u32 value = GTE::ReadRegister(static_cast<u32>(inst.r.rd.GetValue()));'
-          new1 = '''const u32 idx = static_cast<u32>(inst.r.rd.GetValue());
-                    u32 value = GTE::ReadRegister(idx);
-                    u32 scaled_value = value;
-                    if (SIE::g_enabled && SIE::g_z_scale > 1) {
-                        if (idx == 7 || (idx >= 16 && idx <= 19)) {
-                            u16 z = static_cast<u16>(value & 0xFFFF);
-                            if (z > 100) {
-                                z = static_cast<u16>(z / SIE::g_z_scale);
-                                if (z < 1) z = 1;
-                            }
-                            scaled_value = (value & 0xFFFF0000) | z;
-                        }
-                    }'''
-          cc = cc.replace(old1, new1)
-          cc = cc.replace('WriteRegDelayed(inst.r.rt, value);', 'WriteRegDelayed(inst.r.rt, scaled_value);')
+          # ------------------------------------------------------------
+          # 2. Patch cpu_core.cpp – interpreter blocks
+          # ------------------------------------------------------------
+          cp_path = 'duckstation/src/core/cpu_core.cpp'
+          with open(cp_path, 'r') as f:
+              lines = f.readlines()
 
-          # SWC2 (store)
-          old2 = 'const u32 value = GTE::ReadRegister(ZeroExtend32(static_cast<u8>(inst.i.rt.GetValue())));'
-          new2 = '''const u32 idx = ZeroExtend32(static_cast<u8>(inst.i.rt.GetValue()));
-                    u32 value = GTE::ReadRegister(idx);
-                    u32 scaled_value = value;
-                    if (SIE::g_enabled && SIE::g_z_scale > 1) {
-                        if (idx == 7 || (idx >= 16 && idx <= 19)) {
-                            u16 z = static_cast<u16>(value & 0xFFFF);
-                            if (z > 100) {
-                                z = static_cast<u16>(z / SIE::g_z_scale);
-                                if (z < 1) z = 1;
-                            }
-                            scaled_value = (value & 0xFFFF0000) | z;
-                        }
-                    }'''
-          cc = cc.replace(old2, new2)
-          cc = cc.replace('WriteMemoryWord(addr, value);', 'WriteMemoryWord(addr, scaled_value);')
-          with open(cp, 'w') as f:
-              f.write(cc)
+          # Insert the SIE include after the existing gte.h include
+          new_lines = []
+          for line in lines:
+              new_lines.append(line)
+              if line.strip() == '#include "gte.h"':
+                  new_lines.append('#include "sise/sie.h"\n')
+          lines = new_lines
 
-          # Patch gte.h (add ScaleZRegister declaration)
-          gte_h = 'duckstation/src/core/gte.h'
-          with open(gte_h, 'r') as f:
-              gteh = f.read()
-          if 'ScaleZRegister' not in gteh:
-              gteh = gteh.replace('}; // namespace GTE', '  u32 ScaleZRegister(u32 idx, u32 value);\n}; // namespace GTE')
-          with open(gte_h, 'w') as f:
-              f.write(gteh)
+          # Helper to patch a block identified by a case label
+          def patch_block(case_label, read_pattern, write_pattern, lines_list):
+              """Surgically insert scaled_value inside a case block."""
+              in_block = False
+              result = []
+              for i, line in enumerate(lines_list):
+                  # Enter block when we see the case label
+                  if case_label in line:
+                      in_block = True
+                  # Leave block when next case or default is encountered
+                  elif line.strip().startswith(('case ', 'default:')) and in_block:
+                      in_block = False
 
-          # Patch gte.cpp
-          gte_cpp = 'duckstation/src/core/gte.cpp'
-          with open(gte_cpp, 'r') as f:
+                  if in_block and read_pattern in line:
+                      # Capture indentation
+                      indent = line[:len(line) - len(line.lstrip())]
+                      # Keep original line
+                      result.append(line)
+                      # Add scaling lines
+                      result.append(f'{indent}u32 scaled_value = value;\n')
+                      result.append(f'{indent}SIE::ScaleGTERegister(static_cast<u32>(inst.r.rd.GetValue()), scaled_value);\n')
+                  elif in_block and write_pattern in line:
+                      # Replace 'value' with 'scaled_value' in the write call
+                      result.append(line.replace('value', 'scaled_value'))
+                  else:
+                      result.append(line)
+              return result
+
+          lines = patch_block('case MFC2:',
+                              'GTE::ReadRegister(static_cast<u32>(inst.r.rd.GetValue()))',
+                              'WriteRegDelayed(inst.r.rt, value);',
+                              lines)
+
+          lines = patch_block('case SWC2:',
+                              'GTE::ReadRegister(ZeroExtend32(static_cast<u8>(inst.i.rt.GetValue())))',
+                              'WriteMemoryWord(addr, value);',
+                              lines)
+
+          with open(cp_path, 'w') as f:
+              f.writelines(lines)
+
+          # ------------------------------------------------------------
+          # 3. Patch gte.cpp – OTZ scaling + recompiler helper
+          # ------------------------------------------------------------
+          gte_path = 'duckstation/src/core/gte.cpp'
+          with open(gte_path, 'r') as f:
               gte = f.read()
+
+          # Add SIE include
+          gte = gte.replace('#include "gte.h"', '#include "gte.h"\n#include "sise/sie.h"')
+
+          # Add ScaleZRegister function for the recompiler
           if 'ScaleZRegister' not in gte:
               gte = gte.replace('} // namespace GTE',
-                                'u32 GTE::ScaleZRegister(u32 idx, u32 value) {\n    extern u32 SIE_ScaleZ_Helper(u32, u32);\n    return SIE_ScaleZ_Helper(idx, value);\n}\n} // namespace GTE')
-          # OTZ scaling
+                                'u32 ScaleZRegister(u32 idx, u32 value) {\n'
+                                '    SIE::ScaleGTERegister(idx, value);\n'
+                                '    return value;\n'
+                                '}\n'
+                                '} // namespace GTE')
+
+          # OTZ scaling inside RTPS / RTPT
           if 'const u16 otz = TruncateToU16(m_mac[0] >> 12);' in gte:
               gte = gte.replace('const u16 otz = TruncateToU16(m_mac[0] >> 12);',
-                                'const u16 otz = TruncateToU16(m_mac[0] >> 12);\n          if (SIE::g_enabled && SIE::g_z_scale > 1) {\n            u32 scaled_otz = otz / SIE::g_z_scale;\n            m_mac[0] = (m_mac[0] & ~0xFFFF) | (scaled_otz & 0xFFFF);\n          }')
-          with open(gte_cpp, 'w') as f:
+                                'const u16 otz = TruncateToU16(m_mac[0] >> 12);\n'
+                                '          if (SIE::g_enabled && SIE::g_z_scale > 1) {\n'
+                                '            u32 scaled_otz = otz / SIE::g_z_scale;\n'
+                                '            m_mac[0] = (m_mac[0] & ~0xFFFF) | (scaled_otz & 0xFFFF);\n'
+                                '          }')
+          with open(gte_path, 'w') as f:
               f.write(gte)
 
-          # Recompiler patch (if exists)
+          # ------------------------------------------------------------
+          # 4. Recompiler patch (if file exists)
+          # ------------------------------------------------------------
           rc_path = None
           for candidate in ['duckstation/src/core/cpu_recompiler_codegen.cpp',
                             'duckstation/src/core/cpu_recompiler_codegen_x86.cpp',
@@ -175,17 +149,20 @@ jobs:
                   rc = f.read()
               rc = rc.replace(
                   'Value val = CallCFunc(&GTE::ReadRegister, MakeRegParam(idx));',
-                  'Value original_val = CallCFunc(&GTE::ReadRegister, MakeRegParam(idx));\n              Value val = CallCFunc(&GTE::ScaleZRegister, MakeRegParam(idx), original_val);')
+                  'Value original_val = CallCFunc(&GTE::ReadRegister, MakeRegParam(idx));\n'
+                  '              Value val = CallCFunc(&GTE::ScaleZRegister, MakeRegParam(idx), original_val);')
               rc = rc.replace(
                   'CallCFunc(&PGXP::CPU_MFC2, MakeRegParam(inst.bits), val);',
                   'CallCFunc(&PGXP::CPU_MFC2, MakeRegParam(inst.bits), original_val);')
               with open(rc_path, 'w') as f:
                   f.write(rc)
 
-          # UI widget
+          # ------------------------------------------------------------
+          # 5. UI widget (Enhanced Draw Distance settings page)
+          # ------------------------------------------------------------
           ui_h = 'duckstation/src/duckstation-qt/sisesettingswidget.h'
           with open(ui_h, 'w') as f:
-              f.write('''#pragma once
+              f.write("""#pragma once
           #include <QWidget>
           class QCheckBox;
           class QLabel;
@@ -200,7 +177,8 @@ jobs:
               QSlider* m_scaleSlider;
               QLabel* m_scaleLabel;
               QLabel* m_statusLabel;
-          };''')
+          };""")
+
           ui_cpp = 'duckstation/src/duckstation-qt/sisesettingswidget.cpp'
           with open(ui_cpp, 'w') as f:
               f.write('''#include "sisesettingswidget.h"
@@ -258,11 +236,16 @@ jobs:
               sc = sc.replace('#include "graphicssettingswidget.h"',
                               '#include "sisesettingswidget.h"\n#include "graphicssettingswidget.h"')
               sc = sc.replace('addWidget(new GraphicsSettingsWidget',
-                              'addWidget(new SIESettingsWidget(m_ui.settingsContainer),\n          tr("Enhanced Draw Distance"),\n          u":/icons/monochrome/svg/eye-line.svg"_s,\n          tr("<strong>Enhanced Draw Distance</strong><hr>Extends draw distance by scaling depth values."));\n  addWidget(new GraphicsSettingsWidget')
+                              'addWidget(new SIESettingsWidget(m_ui.settingsContainer),\n'
+                              '          tr("Enhanced Draw Distance"),\n'
+                              '          u":/icons/monochrome/svg/eye-line.svg"_s,\n'
+                              '          tr("<strong>Enhanced Draw Distance</strong><hr>'
+                              'Extends draw distance by scaling depth values."));\n'
+                              '  addWidget(new GraphicsSettingsWidget')
               with open(sw, 'w') as f:
                   f.write(sc)
 
-          # Update project files
+          # Update project files (.vcxproj)
           vcx = 'duckstation/src/duckstation-qt/duckstation-qt.vcxproj'
           if os.path.exists(vcx):
               with open(vcx, 'r') as f:
@@ -273,6 +256,7 @@ jobs:
                               '<ClInclude Include="settingswindow.h" />\n    <ClInclude Include="sisesettingswidget.h" />')
               with open(vcx, 'w') as f:
                   f.write(vc)
+
           core_vcx = 'duckstation/src/core/core.vcxproj'
           if os.path.exists(core_vcx):
               with open(core_vcx, 'r') as f:
@@ -283,7 +267,8 @@ jobs:
                                 '<ClInclude Include="gte.h" />\n    <ClInclude Include="..\\sise\\sie.h" />')
               with open(core_vcx, 'w') as f:
                   f.write(cvc)
-          print("All SIE patches applied.")
+
+          print("All SIE patches applied successfully.")
 
       - name: Download prebuilt dependencies
         shell: cmd
