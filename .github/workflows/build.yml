@@ -1,4 +1,4 @@
-name: Build DuckStation with SIE Enhanced Draw Distance
+name: Build DuckStation with Enhanced Draw Distance (Patcher + SIE)
 on:
   workflow_dispatch:
 jobs:
@@ -9,213 +9,162 @@ jobs:
         run: git clone --depth 1 https://github.com/stenzek/DuckStation.git duckstation
         shell: cmd
 
-      - name: Apply SIE core patches
+      - name: Apply all enhancements (MIPS patcher + SIE + ImGui UI)
         shell: python
         run: |
           import os, re
 
-          # 1. Create SIE helper library (sie.h / sie.cpp)
-          os.makedirs('duckstation/src/sise', exist_ok=True)
+          # ============================================================
+          # 1. cpu_core.cpp – add SIE Z-scaling (interpreter only)
+          # ============================================================
+          cp = 'duckstation/src/core/cpu_core.cpp'
+          with open(cp, 'r') as f:
+              cc = f.read()
 
-          with open('duckstation/src/sise/sie.h', 'w') as f:
-              f.write("""#pragma once
+          sie_impl = '''
+          // ----- SIE Z-scaling (interpreter-only, PGXP safe) -----
           namespace SIE {
-              extern bool g_enabled;
-              extern unsigned g_z_scale;
-              void ScaleGTERegister(unsigned idx, unsigned& value);
-          }
-          """)
-
-          with open('duckstation/src/sise/sie.cpp', 'w') as f:
-              f.write("""#include "sise/sie.h"
-          #include "core/core.h"
-          namespace SIE {
-              bool g_enabled = false;
-              unsigned g_z_scale = 1;
-              void ScaleGTERegister(unsigned idx, unsigned& value) {
-                  if (!g_enabled || g_z_scale <= 1) return;
+              static bool s_enabled = true;
+              static u32 s_scale = 4;
+              void SetEnabled(bool e) { s_enabled = e; }
+              bool IsEnabled() { return s_enabled; }
+              void SetScale(u32 s) { s_scale = s; }
+              u32 GetScale() { return s_scale; }
+              void ScaleRegister(u32 idx, u32& value) {
+                  if (!s_enabled || s_scale <= 1) return;
                   if (idx == 7 || (idx >= 16 && idx <= 19)) {
-                      unsigned z = value & 0xFFFF;
+                      u16 z = (u16)(value & 0xFFFF);
                       if (z > 100) {
-                          z /= g_z_scale;
+                          z = (u16)(z / s_scale);
                           if (z < 1) z = 1;
                       }
-                      value = (value & 0xFFFF0000) | (z & 0xFFFF);
+                      value = (value & 0xFFFF0000) | z;
                   }
               }
           }
-          """)
+          '''
+          cc = cc.replace('#include "gte.h"', '#include "gte.h"\n' + sie_impl)
 
-          # 2. Patch cpu_core.cpp (interpreter)
-          cp_path = 'duckstation/src/core/cpu_core.cpp'
-          with open(cp_path, 'r') as f:
-              lines = f.readlines()
+          cc = cc.replace(
+              'const u32 value = GTE::ReadRegister(static_cast<u32>(inst.r.rd.GetValue()));',
+              'const u32 value = GTE::ReadRegister(static_cast<u32>(inst.r.rd.GetValue()));\n          SIE::ScaleRegister(static_cast<u32>(inst.r.rd.GetValue()), value);'
+          )
+          cc = cc.replace(
+              'const u32 value = GTE::ReadRegister(ZeroExtend32(static_cast<u8>(inst.i.rt.GetValue())));',
+              'const u32 value = GTE::ReadRegister(ZeroExtend32(static_cast<u8>(inst.i.rt.GetValue())));\n          SIE::ScaleRegister(ZeroExtend32(static_cast<u8>(inst.i.rt.GetValue())), value);'
+          )
+          with open(cp, 'w') as f:
+              f.write(cc)
 
-          new_lines = []
-          for line in lines:
-              new_lines.append(line)
-              if line.strip() == '#include "gte.h"':
-                  new_lines.append('#include "sise/sie.h"\n')
-          lines = new_lines
+          # ============================================================
+          # 2. imgui_overlays.cpp – add MIPS patcher & combined UI
+          # ============================================================
+          imgui = 'duckstation/src/core/imgui_overlays.cpp'
+          with open(imgui, 'r') as f:
+              ic = f.read()
 
-          def patch_block(case_label, read_pattern, write_pattern, lines_list):
-              in_block = False
-              result = []
-              for line in lines_list:
-                  if case_label in line:
-                      in_block = True
-                  elif line.strip().startswith(('case ', 'default:')) and in_block:
-                      in_block = False
+          # Add bus.h include
+          ic = ic.replace('#include "common/log.h"', '#include "common/log.h"\n#include "bus.h"')
 
-                  if in_block and read_pattern in line:
-                      indent = line[:len(line) - len(line.lstrip())]
-                      result.append(line)
-                      result.append(f'{indent}u32 scaled_value = value;\n')
-                      result.append(f'{indent}SIE::ScaleGTERegister(static_cast<u32>(inst.r.rd.GetValue()), scaled_value);\n')
-                  elif in_block and write_pattern in line:
-                      result.append(line.replace('value', 'scaled_value'))
-                  else:
-                      result.append(line)
-              return result
+          # MIPS patcher code (placed at the beginning of the file, after includes)
+          patcher_code = '''
+          // ----- MIPS auto-patcher for draw distance -----
+          namespace DrawDistancePatcher {
+              static bool   s_patched = false;
+              static int    s_patch_count = 0;
+              static const u32 kMaxPatch = 0x7FFF;
 
-          lines = patch_block('case MFC2:',
-                              'GTE::ReadRegister(static_cast<u32>(inst.r.rd.GetValue()))',
-                              'WriteRegDelayed(inst.r.rt, value);',
-                              lines)
+              void ScanAndPatch() {
+                  if (s_patched) return;
+                  if (!Bus::g_ram || Bus::g_ram_size < 2048) return;
 
-          lines = patch_block('case SWC2:',
-                              'GTE::ReadRegister(ZeroExtend32(static_cast<u8>(inst.i.rt.GetValue())))',
-                              'WriteMemoryWord(addr, value);',
-                              lines)
+                  const u8* ram = Bus::g_ram;
+                  u32 text_addr = 0, text_size = 0;
+                  const u8 magic[8] = {'P','S','-','X',' ','E','X','E'};
+                  for (u32 i = 0; i < Bus::g_ram_size - 0x800; ++i) {
+                      if (!memcmp(ram + i, magic, 8)) {
+                          const u8* h = ram + i;
+                          text_addr = h[0x18] | (h[0x19]<<8) | (h[0x1A]<<16) | (h[0x1B]<<24);
+                          text_size = h[0x1C] | (h[0x1D]<<8) | (h[0x1E]<<16) | (h[0x1F]<<24);
+                          break;
+                      }
+                  }
+                  if (text_size == 0 || text_addr + text_size > Bus::g_ram_size) return;
 
-          with open(cp_path, 'w') as f:
-              f.writelines(lines)
+                  const u8* code = ram + text_addr;
+                  for (u32 off = 0; off + 12 <= text_size; off += 4) {
+                      u32 w = *(u32*)(code + off);
+                      u32 op = w >> 26;
+                      if (op != 0x0A && op != 0x0B) continue;
+                      int16_t imm = (int16_t)(w & 0xFFFF);
+                      if (imm < 100 || imm > 2000) continue;
+                      u32 rt = (w >> 16) & 0x1F;
+                      for (u32 j = 1; j <= 3 && off + j*4 + 4 <= text_size; ++j) {
+                          u32 bw = *(u32*)(code + off + j*4);
+                          u32 bop = bw >> 26;
+                          u32 bfunct = bw & 0x3F;
+                          bool hit = false;
+                          if ((bop == 0x04 || bop == 0x05) && (((bw>>21)&0x1F)==rt || ((bw>>16)&0x1F)==rt)) hit = true;
+                          else if ((bop == 0x06 || bop == 0x07) && ((bw>>21)&0x1F)==rt) hit = true;
+                          else if (bop == 0x01 && (bfunct==0x00||bfunct==0x01) && ((bw>>21)&0x1F)==rt) hit = true;
+                          if (hit) {
+                              *(u32*)(Bus::g_ram + text_addr + off) = (w & 0xFFFF0000) | (kMaxPatch & 0xFFFF);
+                              ++s_patch_count;
+                              break;
+                          }
+                      }
+                  }
+                  s_patched = true;
+              }
 
-          # 3. Patch gte.cpp (OTZ scaling + recompiler helper)
-          gte_path = 'duckstation/src/core/gte.cpp'
-          with open(gte_path, 'r') as f:
-              gte = f.read()
+              bool IsPatched() { return s_patched; }
+              int  GetPatchCount() { return s_patch_count; }
+          }
+          '''
 
-          gte = gte.replace('#include "gte.h"', '#include "gte.h"\n#include "sise/sie.h"')
+          # Insert patcher code after includes block (use a fixed anchor)
+          ic = ic.replace('#include "bus.h"', '#include "bus.h"\n' + patcher_code)
 
-          if 'ScaleZRegister' not in gte:
-              gte = gte.replace('} // namespace GTE',
-                                'u32 ScaleZRegister(u32 idx, u32 value) {\n'
-                                '    SIE::ScaleGTERegister(idx, value);\n'
-                                '    return value;\n'
-                                '}\n'
-                                '} // namespace GTE')
-
-          if 'const u16 otz = TruncateToU16(m_mac[0] >> 12);' in gte:
-              gte = gte.replace('const u16 otz = TruncateToU16(m_mac[0] >> 12);',
-                                'const u16 otz = TruncateToU16(m_mac[0] >> 12);\n'
-                                '          if (SIE::g_enabled && SIE::g_z_scale > 1) {\n'
-                                '            u32 scaled_otz = otz / SIE::g_z_scale;\n'
-                                '            m_mac[0] = (m_mac[0] & ~0xFFFF) | (scaled_otz & 0xFFFF);\n'
-                                '          }')
-          with open(gte_path, 'w') as f:
-              f.write(gte)
-
-          # 4. Recompiler patch (if file exists)
-          rc_path = None
-          for candidate in ['duckstation/src/core/cpu_recompiler_codegen.cpp',
-                            'duckstation/src/core/cpu_recompiler_codegen_x86.cpp',
-                            'duckstation/src/core/cpu_recompiler.cpp']:
-              if os.path.exists(candidate):
-                  rc_path = candidate
-                  break
-          if rc_path:
-              with open(rc_path, 'r') as f:
-                  rc = f.read()
-              rc = rc.replace(
-                  'Value val = CallCFunc(&GTE::ReadRegister, MakeRegParam(idx));',
-                  'Value original_val = CallCFunc(&GTE::ReadRegister, MakeRegParam(idx));\n'
-                  '              Value val = CallCFunc(&GTE::ScaleZRegister, MakeRegParam(idx), original_val);')
-              rc = rc.replace(
-                  'CallCFunc(&PGXP::CPU_MFC2, MakeRegParam(inst.bits), val);',
-                  'CallCFunc(&PGXP::CPU_MFC2, MakeRegParam(inst.bits), original_val);')
-              with open(rc_path, 'w') as f:
-                  f.write(rc)
-
-          # 5. Add SIE files to core.vcxproj
-          core_vcx = 'duckstation/src/core/core.vcxproj'
-          if os.path.exists(core_vcx):
-              with open(core_vcx, 'r') as f:
-                  cvc = f.read()
-              cvc = cvc.replace('<ClCompile Include="gte.cpp" />',
-                                '<ClCompile Include="gte.cpp" />\n    <ClCompile Include="..\\sise\\sie.cpp" />')
-              cvc = cvc.replace('<ClInclude Include="gte.h" />',
-                                '<ClInclude Include="gte.h" />\n    <ClInclude Include="..\\sise\\sie.h" />')
-              with open(core_vcx, 'w') as f:
-                  f.write(cvc)
-
-          print("SIE core patches applied.")
-
-      - name: Add ImGui overlay for SIE controls
-        shell: python
-        run: |
-          imgui_path = 'duckstation/src/core/imgui_overlays.cpp'
-          with open(imgui_path, 'r') as f:
-              content = f.read()
-
-          # We'll add a new overlay function that draws the SIE window.
-          # Insert it just before the end of the file, before the final closing brace of the namespace.
-          overlay_code = '''
-          void DrawSIEWindow()
+          # Add the ImGui window function (append at the very end)
+          overlay_window = '''
+          void DrawEnhancedDrawDistanceWindow()
           {
-              if (!g_gpu_settings.display_show_osd)
-                  return;
-
-              ImGui::SetNextWindowSize(ImVec2(300, 150), ImGuiCond_FirstUseEver);
-              if (ImGui::Begin("Enhanced Draw Distance (SIE)", nullptr, ImGuiWindowFlags_NoCollapse))
+              ImGui::SetNextWindowSize(ImVec2(350, 200), ImGuiCond_FirstUseEver);
+              if (ImGui::Begin("Enhanced Draw Distance", nullptr, ImGuiWindowFlags_NoCollapse))
               {
-                  bool enabled = SIE::g_enabled;
-                  if (ImGui::Checkbox("Enable Z-scaling", &enabled))
-                  {
-                      SIE::g_enabled = enabled;
-                      Core::SetBaseBoolSettingValue("sise", "enabled", enabled);
+                  if (ImGui::Button("Scan & Patch (MIPS)"))
+                      DrawDistancePatcher::ScanAndPatch();
+                  ImGui::SameLine();
+                  ImGui::Text("Patches: %d", DrawDistancePatcher::GetPatchCount());
+
+                  bool sie = SIE::IsEnabled();
+                  if (ImGui::Checkbox("Z-scaling (SIE)", &sie))
+                      SIE::SetEnabled(sie);
+                  if (sie) {
+                      int scale = (int)SIE::GetScale();
+                      ImGui::SliderInt("Multiplier", &scale, 1, 16);
+                      if (scale != (int)SIE::GetScale())
+                          SIE::SetScale((u32)scale);
                   }
 
-                  int scale = static_cast<int>(SIE::g_z_scale);
-                  ImGui::SliderInt("Multiplier", &scale, 1, 16);
-                  if (scale != static_cast<int>(SIE::g_z_scale))
-                  {
-                      SIE::g_z_scale = static_cast<unsigned>(scale);
-                      Core::SetBaseFloatSettingValue("sise", "z_scale_factor", static_cast<float>(scale));
-                  }
-
-                  ImGui::Text("Status: %s (x%d)",
-                              SIE::g_enabled ? "ON" : "OFF",
-                              SIE::g_enabled ? SIE::g_z_scale : 1);
+                  ImGui::Separator();
+                  ImGui::TextColored(ImVec4(1,1,0,1), "%s %s",
+                      DrawDistancePatcher::IsPatched() ? "PATCHER ON" : "PATCHER OFF",
+                      SIE::IsEnabled() ? "SIE ON" : "SIE OFF");
               }
               ImGui::End();
           }
           '''
+          ic += overlay_window   # add at the end of the file
 
-          # Insert the function before the last closing brace of the namespace.
-          # We'll find the last occurrence of '}' and place the function before it.
-          last_brace = content.rfind('}')
-          content = content[:last_brace] + overlay_code + '\n' + content[last_brace:]
+          # Now insert the call to DrawEnhancedDrawDistanceWindow inside the existing overlay loop.
+          # We'll locate the line that draws another overlay (DrawInputsOverlay) and add after it.
+          ic = ic.replace('DrawInputsOverlay();', 'DrawInputsOverlay();\n  DrawEnhancedDrawDistanceWindow();')
 
-          # Now we need to call DrawSIEWindow from the existing DrawOSD function.
-          # Find a line that calls other overlay windows (e.g., DrawInputsOverlay).
-          # A common pattern: if (show_inputs) DrawInputsOverlay();
-          # We'll add a call after that.
-          content = content.replace(
-              'DrawInputsOverlay();',
-              'DrawInputsOverlay();\n  DrawSIEWindow();'
-          )
+          with open(imgui, 'w') as f:
+              f.write(ic)
 
-          with open(imgui_path, 'w') as f:
-              f.write(content)
-
-          # Also add the include for SIE header at the top of the file.
-          content = content.replace(
-              '#include "common/log.h"',
-              '#include "common/log.h"\n#include "sise/sie.h"'
-          )
-          with open(imgui_path, 'w') as f:
-              f.write(content)
+          print("All enhancements applied – no new files, no project modifications.")
 
       - name: Download prebuilt dependencies
         shell: cmd
@@ -236,10 +185,10 @@ jobs:
         run: |
           echo. > duckstation\bin\x64\portable.txt
           (echo [sise] && echo enabled=true && echo z_scale_factor=4.0 && echo show_overlay=true) > duckstation\bin\x64\settings.ini
-          7z a duckstation-sie.7z duckstation\bin\x64\*
+          7z a duckstation-enhanced.7z duckstation\bin\x64\*
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
-          name: duckstation-sie
-          path: duckstation-sie.7z
+          name: duckstation-enhanced
+          path: duckstation-enhanced.7z
